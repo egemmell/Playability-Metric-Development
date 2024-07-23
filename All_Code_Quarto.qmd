@@ -1,0 +1,1744 @@
+---
+title: Development of an urban playability metric
+author: "Emily Gemmell"
+format: html
+        code-fold: true
+        code-link: true
+editor: visual
+bibliography: references.bib
+csl:nature.csl
+toc: true
+---
+
+# 1. Introduction
+
+The PlayScore is a composite metric for assessing neighbourhood playability for young children at the postal code level across 35 of the largest Canadian cities. The metric consists of 5 dimensions and 15 indicators, developed based on an evidence-based theoretical framework and an expert survey. This document provides code used for indicator development, weighting and aggregation into 5 domains, and weighting and aggregation of domains into the composite PlayScore.
+
+```{r}
+
+
+```
+
+# Metric Development
+
+## Dimensions and Indicators
+
++-----------------------------+------------------------------------------------+-----------------------------------------------------+
+| Dimension                   | Indicators                                     | Data Sources                                        |
++=============================+================================================+=====================================================+
+| Traffic Environment         | Intersections                                  | Open Street Map                                     |
+|                             |                                                |                                                     |
+|                             | Road type                                      | Open Street Map                                     |
+|                             |                                                |                                                     |
+|                             | Walking routes                                 | Open Street Map                                     |
+|                             |                                                |                                                     |
+|                             | Cycling routes                                 | CanBICS                                             |
++-----------------------------+------------------------------------------------+-----------------------------------------------------+
+| Social Environment          | Children in neighbourhood                      | Statistics Canada Census of Population, 2016        |
+|                             |                                                |                                                     |
+|                             | Neighbourhood residential mobility             |                                                     |
+|                             |                                                |                                                     |
+|                             | Neighbourhood immigration                      |                                                     |
++-----------------------------+------------------------------------------------+-----------------------------------------------------+
+| Natural Environment         | NDVI                                           | CANUE                                               |
+|                             |                                                |                                                     |
+|                             | Tree canopy                                    | CANUE                                               |
+|                             |                                                |                                                     |
+|                             | Blue Space                                     | CanMap Content Suite v.3 2020                       |
++-----------------------------+------------------------------------------------+-----------------------------------------------------+
+| Space for Play              | Parks                                          | Open Street Map                                     |
+|                             |                                                |                                                     |
+|                             | Percent land not covered in building footprint | CANUE                                               |
++-----------------------------+------------------------------------------------+-----------------------------------------------------+
+| Child Relevant Destinations | Schools,                                       | Open Database of Sports and Recreational Facilities |
+|                             |                                                |                                                     |
+|                             | community centers,                             | Open Database of Educational Facilities             |
+|                             |                                                |                                                     |
+|                             | libraries                                      | Open Street Map                                     |
++-----------------------------+------------------------------------------------+-----------------------------------------------------+
+
+## Study Area Geography
+
+We created shapefiles for postal codes across 35 of the largest Canadian cities (Census Metropolitan Areas) from CanMap Content Suite v. 3, 2020 [@dmtispatialinc.2020]. Postal codes and dissemination areas from CanMap Content Suite v. 3, 2020 correspond to census geography used in the 2016 Canadian census.
+
+```{r}
+library(tidyverse)
+library(sf)
+
+CMAfull = st_read("Data/CensusMetropolitanAreaRegion2016/CensusMetropolitanAreaRegion2016.shp")
+
+CMAcodes <- as.character(c(932, # Abbotsford, Mission
+                           568, # Barrie
+                           522, # Belleville
+                           543, # Brantford
+                           825, # Calgary
+                           835, # Edmonton
+                           580, # Greater Sudbury
+                           550, # Guelph
+                           205, # Halifax
+                           537, # Hamilton
+                           915, # Kelowna
+                           521, # Kingston
+                           541, # Kitchener -- Cambridge-- Waterloo
+                           810, # Lethbridge
+                           555, # London
+                           305, # Moncton
+                           462, # Montreal
+                           532, # Oshawa
+                           505, # Ottawa
+                           529, # Peterborough
+                           421, # Quebec
+                           705, # Regina
+                           408, # Saguenay
+                           310, # Saint john
+                           725, # Saskatoon
+                           433, # Sherbrooke
+                           539, # St Catarines, Niagara
+                           111, # St. Johns
+                           595, # Thunder Bay
+                           535, # Toronto
+                           442, # Trois-Rivieres
+                           933, # Vancouver
+                           935, # Victoria
+                           559, # Windsor
+                           602)) # Winnipeg
+
+CMAshape = filter(CMAfull, CMAUID %in% CMAcodes)
+CMAshape = CMAshape[,c(4,5)]
+
+CMAPC <- st_read("Data/CanMapPostalCodeSuite.gdb/CanMapPC_full_2020.shp")
+
+#Single Link indicator 1 = main postal code record when multiple records exist
+CMAPC <- CMAPC[CMAPC$SLI == 1, c(4,27,28)]  
+
+for (i in CMAcodes) {
+  tempcma <- CMAshape[which(CMAshape$CMAUID == i),]
+  temppc <- st_intersection(tempcma, CMAPC)
+
+# save the CanMap 2020 postal codes within each CMA shapefile
+# (CanMap 2020 postal codes correspond to the geographies used in Statistics
+# Canada 2016 census)
+  
+  st_write(temppc, paste0("Data/CanMapPC/CMAPC",i, ".shp")) 
+  rm(tempcma,temppc)
+  gc()
+}
+
+
+```
+
+We limited the dissemination areas from CanMap Content Suite v.3 2020 to those within included CMAs (these correspond to the geographies used in Statistics Canada's 2016 census).
+
+```{r}
+library(readr)
+library(sf)
+library(tidyverse)
+
+dissem <- st_read("Data/Dissemination Areas/DisseminationAreaRegion2016.shp")
+
+load("Data/CMAcodes")
+
+dissem <- st_transform(dissem, 3347)
+
+# change 001 to 111 for St.John's as the 001 may be misread as 1 if data type
+# is read as numeric (which may happen when saved as a csv)
+
+dissem$CMAUID <- as.character(dissem$CMAUID)
+dissem$CMAUID[dissem$CMAUID == "001"]<- "111"
+
+#limit dissemination areas to those associated with study city postal codes
+
+# limit to needed columns
+dissem <- dissem[, c(2, 14)]
+  
+st_write(dissem, paste0("Data/Dissemination Areas/da_2016.csv"))
+  
+rm(dissem)
+gc()
+
+```
+
+## Indicator data: downloads, cleaning and preparation
+
+### Road network data
+
+We used Open Street Map road networks to develop many of the indicators used in the playability metric. Here we download OpenStreetMap data for street networks and walking paths, adding a 1000m buffer around the CMA boundaries to capture road networks around postal codes that may be located just inside the CMA boundaries).
+
+```{r}
+
+remotes::install_github('ropensci/osmdata')
+library(osmdata)
+library(sf)
+library(tidyverse)
+library(units)
+library(terrainr)
+library(stplanr)
+
+available_features()
+
+setwd("Metric Development/Playability Metric")
+
+load("Data/CMAcodes")
+
+dir.create("Data/OSMdata/OSMroads")
+
+for (i in CMAcodes) {
+  tempsf <- st_read(paste0("Data/CanMapPC/CMAPC", i, ".shp"))
+  tempsf <- st_transform(tempsf, 4326)
+  bb <- add_bbox_buffer(tempsf, 1000, distance_unit = "meters", error_crs = NULL)
+  temposm <- opq(bbox = bb) %>%
+    add_osm_feature(key = "highway", value = c("motorway",
+                                               "trunk",
+                                               "primary",
+                                               "secondary",
+                                               "tertiary",
+                                               "unclassified",
+                                               "residential",
+                                               "living_street",
+                                               "pedestrian",
+                                               "motorway_link",
+                                               "trunk_link",
+                                               "primary_link",
+                                               "secondary_link",
+                                               "tertiary_link",
+                                               "road",
+                                               "cycleway",
+                                               "footway",
+                                               "steps",
+                                               "path")) %>%
+    osmdata_sf() 
+  templines <- temposm$osm_lines
+  rm(temposm, tempsf)
+  gc()
+  templines <- templines[,"highway"]
+  templines$highway <- recode(templines$highway, motorway_link = "Motorway",
+                           motorway = "Motorway",
+                           trunk = "Highway",
+                           trunk_link = "Highway", 
+                           primary= "Highway", 
+                           primary_link = "Highway",
+                           secondary = "Major_Road",
+                           secondary_link = "Major_Road", 
+                           unclassified = "Local_Road",
+                           road = "Local_Road", 
+                           tertiary = "Major_Road",
+                           tertiary_link = "Major_Road", 
+                           residential = "Local_Road" , 
+                           service = "Local_Road" ,
+                           living_street = "Walking_Street",
+                           pedestrian = "Walking_Street",
+                           cycleway = "Cycle_Way",  
+                           steps = "Path",
+                           path = "Path",
+                           footway = "Path")
+  tempnm <- paste0("Data/OSMdata/OSMroads/OSMroads2_", i, ".shp")
+  st_write(templines, tempnm, append = FALSE)
+  rm(templines)
+  gc()
+}
+
+
+```
+
+### Intersection data
+
+Intersection data was derived from OSM road network data using QGIS using the method described in https://gis.stackexchange.com/questions/321985/find-intersections-of-roads-in-qgis
+
+Briefly, in QGIS:
+
+1.. Select Motorway, Highway, Major_Road, Local_Roads from OSM data downloaded for each CMA
+
+2\. Dissolve All (selected variables). You get all features merged as a single multilinestring (all roads show as the first type of road selected)
+
+3\. Multiparts to Singleparts.
+
+4\. Line Intersections (select the same singleparts layer for input and overlay) The resulting points layer will have only the line intersections, but there are duplicate vertices at some nodes
+
+5\. Delete duplicate geometries and save
+
+Later, we will use this intersection point data in r5r to calculate number of intersections within a network buffer around each postal code.
+
+### Child relevant destinations indicators
+
+For each CMA (i), we downloaded data for child-relevant community locations from the Open Database of Sports Facilities (ODSF), the Open Database of Educational Facilities (ODEF), and OpenStreetMap (OSM) sources, converted polygons and multipolygons to points, and combined all data files together, removing duplicates and saving as point and shapefiles.
+
+##### Open Database of Sports Facilities (ODSF)
+
+```{r}
+
+spts <- read_csv("Data/Child_Relevant_Destinations/OD_Sports/ODRSF_v1.0.csv")
+types <- c("playground",
+           "pool", 
+           "park",
+           "community centre", 
+           "gym", 
+           "athletic park", 
+           "rink",
+           "skate park",
+           "splash pad",        
+           "beach",
+           "sports field" )
+
+spts <- filter(spts, ODRSF_facility_type %in% types)
+
+spts <- spts %>%
+  mutate(Latitude = replace(Latitude, Latitude =="..", NA))
+spts <- spts %>%
+  mutate(Longitude = replace(Longitude, Longitude =="..", NA))
+spts$Latitude <- as.numeric(spts$Latitude)
+spts$Longitude <- as.numeric(spts$Longitude)
+
+adultrec <- c(grep("adult", spts$Facility_Name, ignore.case = TRUE)) # get rownames for adult recreation facilities
+seniors <- c(grep("senior", spts$Facility_Name, ignore.case = TRUE)) # get rownames for senior rec facilities
+
+kidspts <- spts[-c(adultrec,seniors),c(1,4,18,19)]   # remove irrelevant columns and adult facilities
+kidspts <- na.omit(kidspts)  
+
+loc <- c("playground", 
+         "park",
+         "splash pad",
+         "beach",
+         "community centre",
+         "gym",
+         "rink",
+         "skate park",
+         "athletic park",
+         "sports field",
+         "pool")
+kidspts <- filter(kidspts, ODRSF_facility_type %in% loc)            # limit to sports, recreation, parks, playgrounds
+
+kidspts$ODRSF_facility_type <- recode(kidspts$ODRSF_facility_type,                                    # recode variables
+                     "playground" ="park",
+                     "pool" = "rec",
+                     "community centre" = "com", 
+                     "gym" = "rec",
+                     "athletic park" = "park",
+                     "rink" = "rec",             
+                     "skate park" = "rec",       
+                     "splash pad" = "park",
+                     "beach" = "park",           
+                     "sports field" = "rec") 
+
+
+kidspts <- st_as_sf(kidspts, coords = c("Longitude", "Latitude"), crs = 4326)
+kidspts  <- as.data.frame(kidspts) %>%
+  st_sf %>%
+  st_cast()
+
+
+kidcoords <- st_coordinates(kidspts)
+kidspts <- cbind(kidspts, kidcoords)
+
+kidspts <- kidspts[,c(2,3,4,5)]
+colnames(kidspts) <- c("id", "lon", "lat", "geometry")
+
+kidspts <- kidspts[,c(1,3,2,4)]      # reorder columns to id, lat, lon, geometry
+
+
+rm(spts, adultrec,loc, seniors, types, kidcoords)
+gc()
+
+```
+
+##### Open Database of Educational Facilities (ODEF)
+
+```{r}
+
+# Make lists for data source types that have geocoding and variables needed
+geos <- c("AGOL", "Nomanatim", "Source")
+seq <- c("Index", 
+         "ISCED010",               
+         "ISCED020",                
+         "ISCED1",
+         "Postal_Code",
+         "Latitude",
+         "Longitude")
+
+temped <- read_csv("Data/Child_Relevant_Destinations/ODEFdata/ODEF_v2.csv")
+
+temped <- temped[temped$Geo_Source %in% geos, seq]   # limit to those records with geocoding
+
+temped <- temped %>%
+  mutate(ISCED010 = replace(ISCED010, ISCED010 =="..", 0))  # replace missing symbol with 0 for childcare/school columns
+
+temped <- temped %>%
+  mutate(ISCED020 = replace(ISCED020, ISCED020 =="..", 0))
+
+temped <- temped %>%
+  mutate(ISCED1 = replace(ISCED1, ISCED1 =="..", 0))
+
+temped$ISCED010 <- as.numeric(temped$ISCED010) # ECE
+temped$ISCED020 <- as.numeric(temped$ISCED020) #kindergarten
+temped$ISCED1 <- as.numeric(temped$ISCED1)    # Elementary
+temped$Latitude <- as.numeric(temped$Latitude)
+temped$Longitude <- as.numeric(temped$Longitude)
+
+# retain records with at least one ECE, Elementary or kindergarten and rbind together
+
+temped_ece <- filter(temped, ISCED010 >0)                           
+temped_kinder <- filter(temped, ISCED020 >0)
+temped_elem <- filter(temped, ISCED1 >0)
+
+# limit to relevant columns, rename columns and set school types (ece, kinder, elem)
+
+temped_ece <- temped_ece[,c(1,6,7)]
+colnames(temped_ece) <- c("id", "lat", "lon")
+temped_ece$id = "school"
+
+temped_kinder <-temped_kinder[,c(1,6,7)]
+colnames(temped_kinder) <- c("id", "lat", "lon")
+temped_kinder$id = "school"
+
+temped_elem <- temped_elem[,c(1,6,7)]
+colnames(temped_elem) <- c("id", "lat", "lon")
+temped_elem$id = "school"
+
+# bind all school types into one dataframe 
+
+temped <- rbind(temped_ece, temped_kinder, temped_elem)
+
+# make an sf file for spatial cropping
+temped <- st_as_sf(temped, coords = c("lon", "lat"), crs = 4326)
+
+
+# put back lat lon columns for future reference
+coords <- st_coordinates(temped)
+temped$lat <- coords[,2]
+temped$lon <- coords[,1]
+
+# reorder columns
+temped <- temped[,c(1,3,4,2)]
+
+rm(coords, geos, seq, temped_elem, temped_kinder, temped_ece)
+
+
+```
+
+##### OSM child relevant destinations
+
+```{for (i in CMAcodes) {}
+  temppc <- st_read(paste0("Data/CanMapPC/CMAPC", 111, ".shp"))
+  temppc <- st_transform(temppc, 4326)
+  bb <- st_bbox(temppc)
+  temposm <- opq(bbox = bb) %>%
+    add_osm_feature(key = "amenity", 
+                    value = c("childcare",
+                              "kindergarten", 
+                              "library")) %>%
+    osmdata_sf() 
+  
+  temppoints <- temposm$osm_points
+  temppoints <- st_transform(temppoints, 3347) 
+  temppoints <- temppoints[!is.na(temppoints$amenity), c("amenity")] 
+  
+  if (is.null(temposm$osm_polygons) == FALSE) {
+    temp_p <- temposm$osm_polygons
+    temp_p <-  st_transform(temp_p, 3347)
+    temp_p <-  st_point_on_surface(temp_p)
+    temp_p <- temp_p[!is.na(temp_p$amenity), c("amenity")]
+    temp_p <- st_cast(temp_p, "POINT")
+  }
+  
+  if (is.null(temposm$osm_multipolygons) == FALSE) {
+    temp_m <- temposm$osm_multipolygons
+    temp_m <- st_transform(temp_m, 3347) 
+    temp_m <- st_point_on_surface(temp_m)
+    temp_m <- temp_m[!is.na(temp_m$amenity), c("amenity")]
+  }
+  
+  if ((is.null(temposm$osm_polygons)== FALSE) && (is.null(temposm$osm_multipolygons) == FALSE)) {
+    temptot <- rbind(temppoints, temp_p, temp_m)
+  } else if(is.null(temp_p)== FALSE){
+    temptot <- rbind(temppoints, temp_p)
+  } else {
+    temptot <- temppoints
+  }
+  
+  temptot <- st_transform(temptot, 4326)
+  coords <- st_coordinates(temptot)
+  
+  temptot <- cbind(temptot, coords)
+  colnames(temptot)<- c("id", "lon", "lat", "geometry")
+  
+  loc <- c("childcare",     # removed other categories as they were empty
+           "kindergarten",  # OSM tag "school" included high schools
+           "library")       # and most elementary schools are likely to 
+                            # be included in ODEF dataset, so removed schools not                              # specified as kindergarten
+  
+  temptot <- filter(temptot, id %in% loc)
+  
+  temptot$id <- recode(temptot$id, childcare = "school",
+                                kindergarten = "school", 
+                                library = "com")
+
+  temptot <- temptot[,c(1,3,2,4)]
+  
+rm(temp_m, temp_p, temposm, temppoints, coords)
+gc()
+ 
+# Add ODSF data
+  
+tempkids <- st_crop(kidspts, temppc)
+  
+ # merge ODSF and OSM parks, community and rec data
+ 
+ crd <- rbind(temptot, tempkids)   # merge OSM and ODSF data
+  
+ crdf <- distinct(crd)             # remove duplicates
+ 
+ rm(temptot, crd, tempkids)
+ gc()
+
+ # Add ODED education location points to child relevant destinations data
+ # note: Latitude and Longitude are switched around in ODED dataset
+
+ tempedpts <- st_crop(temped, temppc)
+ 
+ # merge ODED and OSM/ODSF data to add schools to parks, community and rec points
+ 
+ crdf <- rbind(crdf, tempedpts)   # merge OSM and ODSF data
+ 
+ crdfinal <- distinct(crdf)             # remove duplicates
+ crdfinal <- st_transform(crdfinal, 3347)
+ 
+ 
+ # save shapefiles of crd destination points, including OSM, ODEF, ODSF locations
+ 
+ st_write(crdfinal, paste0("Data/Child_Relevant_Destinations/CRDshapefiles/crd_points_", i, ".shp"), append = FALSE)
+ 
+ crdfinal <- st_transform(crdfinal, 4326)
+ crdfinal <- st_drop_geometry(crdfinal)
+ 
+write_csv(crdfinal, paste0("Data/Child_Relevant_Destinations/CRDcsvfiles/crd_points_", i, ".csv"))
+
+write_csv(crdfinal, paste0("Data/r5r_Road_Networks/r5r", i, "/crd_points_", i, ".csv"))
+  
+rm(crdf,crdfinal, tempedpts)
+gc()
+
+}
+```
+
+### Accessibility calculations: intersections and destinations within 1000m network buffers
+
+We combined all child relevant destinations and intersection points and saved data in r5r folders for each CMA. Using the r5r package, we calculated the number of each type of child-relevant destination (schools, libraries/community centers, sports/recreational facilities) and the number of intersections within 1000m network distance of each postal code.
+
+```{r}
+for (i in CMAcodes){
+  temp_intersections <- st_read(paste0("Data/Traffic_Environment_Dimension/Intersections/inter_", i, ".shp"))
+  temp_intersections$id <- "inter"
+  temp_intersections <- temp_intersections[, c(4,3)]
+  
+  coords <- st_coordinates(temp_intersections)
+  
+  temp_intersections <- cbind(temp_intersections, coords)
+  colnames(temp_intersections)<- c("id", "lon", "lat", "geometry")
+  temp_intersections = temp_intersections[,c(1,3,2,4)]
+  
+  temp_intersections <- st_drop_geometry(temp_intersections)
+  
+  temp_crd <- read_csv(paste0("Data/r5r_Road_Networks/r5r", i, "/crd_points_", i, ".csv"))
+  
+  all_points <- rbind(temp_crd, temp_intersections)
+  
+  all_points$schools <- ifelse(all_points$id == "school", 1,0)
+  all_points$community_center <- ifelse(all_points$id == "com", 1,0)
+  all_points$recreation <- ifelse(all_points$id == "rec", 1, 0)
+  all_points$intersections <- ifelse(all_points$id == "inter", 1, 0)
+  
+  write_csv(all_points, paste0("Data/r5r_Road_Networks/r5r", i, "/crd_points_", i, ".csv"), append = FALSE)
+}
+
+```
+
+(This portion of metric development was computationally intensive, and was carried out within Digital Research Alliance of Canada's advanced research computing environment.)
+
+```{r}
+
+# increase memory available to R
+options(java.parameters = "-Xmx2G")
+library(r5r)
+library(sf)
+library(tidyverse)
+library(data.table)
+library(ggplot2)
+library(akima)
+library(readr)
+library(purrr)
+
+#set inputs
+mode = "WALK"                     
+max_walk_time <- 16 # minutes, approximately 1000m at 3.7 km/hr walking speed range (average of range for 2-6 year olds, 2.8 - 4.6 km/hr)
+max_walk_distance <- 1000
+travel_time_cutoff <- 17
+
+for (i in CMAcodes){
+  # 1) Build transport network, pointing to path were OSM roads and PC point data are stored
+  data_path <- file.path(paste0("W:/Metric Development/Playability Metric 06.2023/Metric-Development-06.2023/Data/r5r_Road_Networks/r5r", i ))
+  r5r_core <-setup_r5(data_path, verbose = FALSE)
+  
+  # check files in data_path
+  list.files(data_path)
+  
+# 2) Load origin/destination points and set arguments
+
+  pcname <- paste0("CMAPC", i, ".csv")
+  pc <- fread(file.path(data_path, pcname))
+  crdname <- paste0("crd_points_", i, ".csv")
+  dest <- fread(file.path(data_path, crdname))
+  
+  # see Decay Functions documentation at https://ipeagit.github.io/r5r/reference/accessibility.html
+  # half-life set to travel_time_cutoff 1 = 0 distance; 0.5 = opportunity at max walk time (16min or 1000m)
+  
+  access <- accessibility(r5r_core,
+                          origins = pc,
+                          destinations = dest,
+                          opportunities_colnames = c("schools","community_center", "recreation", "intersections"),
+                          mode = mode,
+                          max_walk_time = max_walk_time,
+                          cutoffs = travel_time_cutoff,
+                          decay_function = "exponential", 
+                          verbose = FALSE)
+ 
+   # make separate columns for each road type 
+   
+  community_center <- filter(access, opportunity == "community_center")
+  schools <- filter(access, opportunity == "schools")                             
+  recreation <- filter(access, opportunity == "recreation")
+  intersections <- filter(access, opportunity == "intersections")
+  
+  crds <- list(schools,community_center, recreation) %>% 
+    reduce(full_join, by= "id")
+  
+  crds <- crds[,c(1,5,9,13)]
+  colnms <- c("id", "schools","community_center", "recreation")
+  colnames(crds)<- colnms
+
+  crd <- merge(pc, crds, by = "id", all.x = TRUE)
+  
+  # replace any empty pc cells with 0
+  crd$recreation <- crd$recreation %>% replace_na(0)
+  crd$community_center <- crd$community_center %>% replace_na(0)
+  crd$schools <- crd$schools %>% replace_na(0)
+
+  
+  write_csv(crd, paste0("W:/Metric Development/Playability Metric 06.2023/Metric-Development-06.2023/Data/Child_Relevant_Destinations/CRD_indicator_scores/crd_ind_", i, ".csv"))
+  
+  # save intersection indicator data
+  intersections <- intersections[, c(1,5)]
+  colnames(intersections) <- c("id", "intersections")
+  
+  write_csv(intersections, paste0("W:/Metric Development/Playability Metric 06.2023/Metric-Development-06.2023/Data/Traffic_Environment_Dimension/Intersections/int_ind", i, ".csv"))
+  
+  
+  rm(access, community_center, crd, crds, recreation, schools)
+  stop_r5(r5r_core)
+  rJava::.jgc(R.gc = TRUE)
+  
+}
+  
+```
+
+## Traffic Environment Indicators
+
+#### **Road type indicator**
+
+This variable characterizes road types and lengths within 250m of each postal code centroid as a proxy for traffic exposure. We categorized road types based on a review of road classification descriptions used across Canada and OSM and the traffic density and speeds for each type.
+
+```{r}
+for (i in CMAcodes){
+  
+  temprd <- st_read(paste0("Data/Traffic_Environment_Dimension/RoadsData/OSMroads2_", i, ".shp")) 
+  temppc <- st_read(paste0("Data/CanMapPC/CMAPC", i, ".shp"))
+  temprd <- st_transform(temprd, 3347)
+  
+  tempbuf <- st_buffer(temppc, dist = 250)
+  tempbuf <- tempbuf[, c("POSTALCODE", "geometry")]
+  rds <- st_intersection(temprd, tempbuf, all = TRUE) # identify roads in each buffer distance from postal code
+  rds$rdlen <- st_length(rds$geometry)    # calculate length of each road type
+  rds <- st_drop_geometry(rds)
+  
+  rds <- rds %>% group_by(POSTALCODE, highway) %>% summarize(rdlen = sum(rdlen))
+  
+# make separate columns for each road type   
+  MTW <- filter(rds, highway == "Motorway")
+  HW <- filter(rds, highway == "Highway")                             
+  MR <- filter(rds, highway == "Major_Road")
+  LR <- filter(rds, highway == "Local_Road")
+  
+  
+  dfs<- list(MTW, HW, MR, LR)
+  
+  rdata <- purrr::reduce((dfs), dplyr::full_join, by = 'POSTALCODE')    # Join all columns by postal code
+  rdata <- rdata %>% mutate_if(is.numeric, drop_units)
+  rdata <- merge(temppc, rdata, by = "POSTALCODE", all.x = TRUE)
+  rdata$mtw <- rdata$rdlen.x %>% replace_na(0)
+  rdata$hw <- rdata$rdlen.y %>% replace_na(0)
+  rdata$mr <- rdata$rdlen.x.x %>% replace_na(0)
+  rdata$lr <- rdata$rdlen.y.y %>% replace_na(0)
+  
+  rdata <- rdata[,c(1,13:16)]
+  rdata <- st_drop_geometry(rdata)
+  
+  rdata$mtw <- (8*rdata$mtw)
+  rdata$hw <- (6*rdata$hw)
+  rdata$mr <- (4*rdata$mr)
+  rdata$lr <- (2*rdata$lr)
+  
+  
+  rdata$rd_total <- rdata$mtw + rdata$hw + rdata$mr + rdata$lr  
+  #   save rdata before calculating z scores for final calculation of across city z scores
+  write.csv(rdata, file = (paste0("Data/Traffic_Environment_Dimension/RoadsData/across_city_rl250_", i, ".csv")), row.names = FALSE)    
+  
+}
+```
+
+Intersection indicator is calculated with r5r along with the child relevant destination points above.
+
+#### Walking routes, cycling routes indicators
+
+Walking route variable is the length of walking streets, non-sidewalk paths (trails) and local roads within a 1000m network buffer over the total length of roads within the same network buffer. Below we download OSM roads, calculate points every 10 m along each road, save points to r5r folders and use r5r to calculate number of points within 1000m of each postal code. We then multiply the sum of points for each road type by 10 to get the length of each road type within a 1000m network buffer of each postal code.
+
+```{r}
+library(osmdata)
+library(sf)
+library(tidyverse)
+library(units)
+library(terrainr)
+library(stplanr)
+
+load("Data/CMAcodes")
+setwd("W:/Metric Development/Playability Metric 06.2023/Metric-Development-06.2023")
+
+# Make csv files for points, every 10m along OSM full road networks
+# Downloaded using osmdata on 10.20.2022 
+
+dir.create("Data/OSMdata/OSMroads")
+
+for (i in CMAcodes2) {
+  temppc <- st_read(paste0("Data/CanMapPC/CMAPC", i, ".shp"))
+  temppc <- st_transform(temppc, 4326)
+  bb <- add_bbox_buffer(temppc, 1000, distance_unit = "meters", error_crs = NULL)
+  temposm <- opq(bbox = bb) %>%
+    add_osm_feature(key = "highway", value = c("motorway",
+                                               "trunk",
+                                               "primary",
+                                               "secondary",
+                                               "tertiary",
+                                               "unclassified",
+                                               "residential",
+                                               "living_street",
+                                               "pedestrian",
+                                               "motorway_link",
+                                               "trunk_link",
+                                               "primary_link",
+                                               "secondary_link",
+                                               "tertiary_link",
+                                               "road",
+                                               "path")) %>%
+    osmdata_sf() 
+  templines <- temposm$osm_lines
+  rm(temposm)
+  gc()
+  temprd <- templines[,"highway"]
+  temprd$highway <- recode(temprd$highway, motorway_link = "Motorway",
+                              motorway = "Motorway",
+                              trunk = "Highway",
+                              trunk_link = "Highway", 
+                              primary= "Highway", 
+                              primary_link = "Highway",
+                              secondary = "Major_Road",
+                              secondary_link = "Major_Road", 
+                              unclassified = "Local_Road",
+                              road = "Local_Road", 
+                              tertiary = "Major_Road",
+                              tertiary_link = "Major_Road", 
+                              residential = "Local_Road" , 
+                              service = "Local_Road" ,
+                              living_street = "Walking_Street",
+                              pedestrian = "Walking_Street",
+                              path = "Path")
+  
+ 
+ 
+ # make point shapefile with points every 10 meters along all MW,HW,MR,LR,WR and PTHs
+ 
+ templntot <- st_cast(temprd, "LINESTRING")    #dissolve multilinestring to single linestring
+ tempsegtot <- st_segmentize(templntot, 10)       #segment into 10m lines
+ tempttot <- st_cast(tempsegtot, "POINT")        # cast lines to points every 10 meters along road network
+ 
+ coords <- st_coordinates(tempttot)
+ 
+ tempttot <- cbind(tempttot, coords)
+ colnames(tempttot)<- c("id", "lon", "lat", "geometry")
+ 
+ tempttot <- st_drop_geometry(tempttot)
+ 
+ tempttot$Local_Road <- ifelse(tempttot$id == "Local_Road", 1,0)
+ tempttot$Major_Road <- ifelse(tempttot$id == "Major_Road", 1,0)
+ tempttot$Motorway <- ifelse(tempttot$id == "Motorway", 1, 0)
+ tempttot$Path<- ifelse(tempttot$id == "Path", 1, 0)
+ tempttot$Highway<- ifelse(tempttot$id == "Highway", 1, 0)
+ tempttot$Walking_Street<- ifelse(tempttot$id == "Walking_Street", 1, 0)
+ 
+ 
+ # save to r5r folders
+ tempnm <- paste0("Data/r5r_Road_Networks/r5r", i, "/rdpts", i, ".csv")
+ 
+ write_csv(tempttot, tempnm, append = FALSE)
+
+ 
+ rm(temppc, temprd, templntot, tempsegtot, tempttot, tempwk, templnwk, tempsegwk,tempptwk)
+ gc()
+ 
+}
+
+############################################################################
+# Make point shapefiles with points every 10 meters along cycling routes
+# and save to r5r folders
+
+for (i in CMAcodes) {
+  tempcy <- st_read(paste0("Data/Traffic_Environment/Cycling/cy_cma_", i, ".shp"))
+  tempcy <- st_transform(tempcy, 4326)
+  
+  #keep only cycling paths that are high or medium comfort on CanBICS scale, and relevant columns
+  tempcy <- tempcy[,c("CBICS_comf", "geometry")]
+  
+  colnames(tempcy) <- c("id", "geometry")
+  
+  tempcy <- filter(tempcy, tempcy$id == "1. High Comfort" | tempcy$id == "2. Medium Comfort")
+  
+  templncy <- st_cast(tempcy, "LINESTRING")    #dissolve multilinestring to single linestring
+  tempsegcy <- st_segmentize(tempcy, 10)       #segment into 10m lines
+  temptcy <- st_cast(tempsegcy, "POINT")        # cast lines to points every 10 meters along road network
+  
+  coords <- st_coordinates(temptcy)
+  
+  temptcy <- cbind(temptcy, coords)
+  colnames(temptcy)<- c("id", "lon", "lat", "geometry")
+  
+  temptcy$high_cyc <- ifelse(temptcy$id == "1. High Comfort", 1,0)
+  temptcy$med_cyc<- ifelse(temptcy$id == "2. Medium Comfort", 1, 0)
+  
+  temptcy <- st_drop_geometry(temptcy)
+  
+  rm(tempcy, tempsegcy, templncy, coords)
+  gc()
+  
+  # save to r5r folders
+  tempnm <- paste0("Data/r5r_Road_Networks/r5r", i, "/cypts", i, ".csv")
+  
+  write_csv(temptcy, tempnm, append = FALSE)
+  
+  rm(temptcy, tempnm)
+  gc()
+  
+}
+
+################################################################################ 
+#Calculate the number of points along all roads, walking routes, cycling routes
+# within 1000m network distance from each postal code
+
+
+options(java.parameters = "-Xmx4G")
+
+library(r5r)
+library(sf)
+library(tidyverse)
+library(data.table)
+library(ggplot2)
+library(akima)
+library(readr)
+library(purrr)
+library(mapview)
+mapviewOptions(platform = 'leafgl')
+
+# set inputs
+mode = "WALK"                     
+max_walk_time <- 16 # minutes, approximately 1000m at 3.7 km/hr walking speed range (average of range for 2-6 year olds, 2.8 - 4.6 km/hr)
+max_walk_distance <- 1000
+travel_time_cutoff <- 17
+
+# make vectors with all road and cycle route types
+roads <- c("Local_Road",
+           "Major_Road",
+           "Motorway", 
+           "Path", 
+           "Highway",
+           "Walking_Street"
+           )
+
+cy_paths <- c("high_cyc", "med_cyc")
+
+# make a function to calculate road and walking lengths within 1000m network buffers
+calculate_rdlen <- function(ii) {
+  network <- accessibility(r5r_core = r5r_core,
+                           origins = pc,
+                           destinations = dest1,
+                           opportunities_colname = ii,
+                           mode = mode,
+                           cutoffs = travel_time_cutoff,
+                           decay_function = 'step', 
+                           verbose = FALSE)
+  new <- as.data.frame(network[, c(1,4)]) 
+  tempnm <- paste0("Data/r5r_Road_Networks/r5r", i, "/", ii, "_", i, ".csv")
+  write_csv(new, tempnm, append = FALSE)
+  rm(network, new)
+  gc()
+}
+
+# vectorize function above with argument for destination data (ii) and roads or cycle data (iii)
+vnet <- Vectorize(FUN = calculate_rdlen, vectorize.args = "ii")
+
+# make a function to calculate high or medium comfort cycling points within 1000m network buffers
+calculate_cycpts <- function(ii) {
+  network <- accessibility(r5r_core = r5r_core,
+                           origins = pc,
+                           destinations = dest2,
+                           opportunities_colname = ii,
+                           mode = mode,
+                           cutoffs = travel_time_cutoff,
+                           decay_function = 'step', 
+                           verbose = FALSE)
+  new <- as.data.frame(network[, c(1,4)]) 
+  tempnm <- paste0("Data/r5r_Road_Networks/r5r", i, "/", ii, "_", i, ".csv")
+  write_csv(new, tempnm, append = FALSE)
+  rm(network, new)
+  gc()
+}
+
+#vectorize function
+cy_net <- Vectorize(FUN = calculate_cycpts, vectorize.args = "ii")
+
+
+# Nest the vectorized functions in a for loop and run for all CMAs (I ran the loop separately for cycling and walking point data)
+for (i in CMAcodes){
+  
+  # 1) Build transport network, pointing to path were OSM roads and PC point data are stored
+  
+  data_path <- file.path(paste0("Data/r5r_Road_Networks/r5r", i))
+  r5r_core <-setup_r5(data_path, verbose = FALSE)
+  
+  # 2) Load origin/destination points and set arguments
+  
+  pcname <- paste0("CMAPC", i, ".csv")            #origin at each PC
+  pc <- fread(file.path(data_path, pcname))
+  
+  rdpts <- paste0("rdpts", i, ".csv")     #destination points - points along road network, walking network, cycling network
+  cypts <- paste0("cypts", i, ".csv")
+  
+  # load destination files, omit NA's, reorder columns: dest1 for all roads, dest2 for cycling paths
+  dest1 <- fread(file.path(data_path, rdpts)) %>%
+    na.omit() 
+  dest1 <- dest1[, c(1,3,2, 4:9)]
+  
+  #run vectorized function on road type vector
+  rdlen <- vnet(roads)
+  
+  #load destinations for cycling paths and run vectorized function
+  dest2 <- fread(file.path(data_path, cypts)) %>%
+  na.omit()
+  dest2 <- dest2[,c(1,3,2,4,5)]
+  
+  dest2$id <- recode(dest2$id, "2. Medium Comfort" = "med_cyc",
+                     "1. High Comfort" = "high_cyc")
+  
+  #run vectorized function on cycle path vector
+  cylen <- cy_net(cy_paths)
+
+  rm(dest1, dest2, rdpts, cypts, pc)
+stop_r5(r5r_core)
+rJava::.jgc(R.gc = TRUE)
+
+}
+ 
+ 
+# load all road networks and make walking route indicator and cycling route indicators
+load("Data/CMAcodes")
+
+# make a vector with all road names
+roads <- c("Motorway", 
+           "Major_Road",
+           "Highway",
+           "Local_Road",
+           "Walking_Street",
+           "Path", 
+           "high_cyc",
+           "med_cyc")
+
+# 932 had duplicates, so put all df's in list
+# datalist <- list()
+for (i in CMAcodes){
+  pc <- read_csv(paste0("Data/r5r_Road_Networks/r5r", i, "/CMAPC", i, ".csv"))
+  pc <- pc[, 1] 
+  for (ii in roads){
+    temp <- read.csv(paste0("Data/r5r_Road_Networks/r5r", i, "/", ii, "_", i, ".csv"))
+    colnames(temp) <- c("id", ii)
+  pc <- merge(pc, temp, by = "id", all.x = TRUE)  
+  #pc <- pc[!duplicated(pc),]
+  #datalist[[ii]] <- temp
+  }
+ 
+  # for 932 merge all data frames in list
+  #temp932 <- datalist %>% reduce(full_join, by='id')
+  #temp932 <- merge(temp932, pc, by = "id")
+  write_csv(temp932, paste0("Data/r5r_Road_Networks/r5r", i, "/wkcy_vars_", i, ".csv"), append = FALSE)
+  rm(pc, temp) 
+  gc()
+  }
+
+#multiply road points by 10 (since they are every 10 meters) to get lengths  
+for (i in CMAcodes){
+  temp <- read_csv(paste0("Data/r5r_Road_Networks/r5r", i, "/wkcy_vars_", i, ".csv"))
+  times_ten <- function(x){
+    x*10
+  }
+ 
+  temp <- temp %>% 
+    mutate_at(vars(Motorway:med_cyc),
+              times_ten) 
+  
+  #add up all road types, multiplying road types in totalwk and total cyc by coefficients and adding 1 to avoid zeros
+  temp$total_rdpts <- temp$Motorway + temp$Major_Road + temp$Highway + temp$Local_Road +1
+  temp$total_wk <- (2*temp$Local_Road) + (6*temp$Walking_Street) + (4*temp$Path) +1
+  temp$total_cyc <- (6*temp$high_cyc) + (4*temp$med_cyc) +1
+  
+  temp$walk_ind <- temp$total_wk / temp$total_rdpts
+  temp$cyc_ind <- temp$total_cyc / temp$total_rdpts
+ 
+  
+  walk_ind <- temp[, c("id", "walk_ind")]
+  cyc_ind <- temp[, c("id", "cyc_ind")]
+  
+  write_csv(walk_ind, paste0("Data/Traffic_Environment_Dimension/Walking/walk_ind_", i, ".csv"))
+  write_csv(cyc_ind, paste0("Data/Traffic_Environment_Dimension/Cycling/cyc_ind_", i, ".csv"))
+
+  rm(temp, walk_ind, cyc_ind)
+  gc()
+}
+
+```
+
+## Social Environment Indicators
+
+We used census microdata, aggregated at the dissemination area level, for three variables: proportion of population under 15 years old, proportion of population who have moved in the past 5 years, and proportion of population that have immigrated in the last 5 years. To meet Statistics Canada requirements for release of data, we aggregated DA's with small populations together with their nearest neighbours, within the secure research environment.
+
+```{r}
+
+library(tidyverse)
+library(sf)
+
+load("Data/CMAcodes")
+
+sdi_census <- read_csv("Data/Social_Environment/final_release_v2.csv")
+
+da_shape <- st_read("Data/Social_Environment/DisseminationAreaRegion2016.shp")
+da_shape <- st_transform(da_shape, 3347)
+da_shape <- da_shape[, "DAUID"]
+da_shape$DAUID <- as.character(da_shape$DAUID)
+sdi_census$DAUID <- as.character(sdi_census$DAUID)
+
+datalist <- list()
+for(i in CMAcodes){
+  temp_pc <- st_read(paste0("Data/CanMapPC/CMAPC", i, ".shp"))
+  temp_pc <- st_transform(temp_pc, 3347)
+  da_pc_data <- merge(sdi_census, da_shape, by = "DAUID", all.x = TRUE)
+  da_pc_data <- st_as_sf(da_pc_data)
+  da_pc_data <- st_intersection(da_pc_data, temp_pc)
+  da_pc_data <- da_pc_data[, c(13, 1,14,3:12)]
+  names(da_pc_data) <- c("id", 
+                  "DAUID", 
+                  "CMAUID", 
+                  "under15_wt_rd", 
+                  "under15_prop", 
+                  "var_under_15", 
+                  "movers5_wt_rd", 
+                  "movers5_prop", 
+                  "var_movers5", 
+                  "imm5_wt_rd", 
+                  "imm5_prop", 
+                  "var_imm5", 
+                  "resident_wt_rd", 
+                  "geometry")
+  #datalist[[i]] <- da_pc_data
+ st_write(da_pc_data, paste0("Data/Social_Environment/sdi_", i, ".shp"), append = FALSE)
+ da_pc_data <- st_drop_geometry(da_pc_data)
+ write_csv(da_pc_data, paste0("Data/Social_Environment/sdi_", i, ".csv"), append = FALSE)
+ rm(temp_pc, da_pc_data)
+ gc()
+}
+
+all_da <- do.call(rbind, datalist)
+st_write(all_da, "Data/Social_Environment/all_da.shp")
+
+rm(all_da)
+gc()
+
+```
+
+## Space for Play Indicators
+
+The space for play domain includes both formal (e.g. parks, playgrounds) and informal (open space) indicators.
+
+#### Formal Play Space Indicator
+
+We calculated the number of parks within a 250m buffer of each postal code centroid using data from CanMap Content Suite 2020 v.3 and OSM data. First we downloaded the park shapefiles from CanMap (ref)
+
+```{r}
+
+load("Data/CMAcodes")
+
+library(sf)
+library(tidyverse)
+library(terrainr)
+library(readr)
+library(stringr)
+library(osmdata)
+library(lwgeom)
+
+parks <- st_read("Data/CMAparks/ParksSportsFieldRegion.shp") 
+parks <- st_transform(parks, 4326)
+
+Pkclass <- c("PARK/SPORTS FIELD",
+             "RECREATION",
+             "DAY USE",
+             "BOTANICAL GARDEN",                  
+             "NATURAL ENVIRONMENT",               
+             "PICNIC SITE",
+             "NATURE RESERVE",
+             "RECREATION AREA",
+             "PROVINCIAL PARK",                    
+             "NATURAL AREA",
+             "PARK RESERVE")
+
+parks <- parks[which(parks$CLASS %in% Pkclass),]
+parks$parks <- 1
+parks <- parks[,"parks"]
+
+st_write(parks, "Data/Space_for_Play_Dimension/CANMAP parks/bigpark.shp")
+```
+
+We saved CanMap park data for each study area.
+
+```{r}
+
+parks <- st_read("Data/Space_for_Play_Dimension/CANMAP parks/bigpark.shp") 
+parks <- st_transform(parks, 4326)
+
+for (i in CMAcodes){
+  temppc <- st_read(paste0("Data/CanMapPC/CMAPC", i, ".shp"))
+  temppc <- st_transform(temppc, 4326)
+  tempbuf <- terrainr::add_bbox_buffer(temppc, 1000, distance_unit = "meters")
+
+  # crop park polygon data to each cma
+  temppks <- st_crop(parks, tempbuf)
+  
+  write_sf(temppks, paste0("Data/Space_for_Play_Dimension/CANMAP parks/cmapks", i, ".shp"))
+  
+  rm(temppc, temppks)
+  gc()
+}
+
+```
+
+We downloaded park data from OpenStreetMap, limited to the study areas. We removed duplicate geographies between CanMap and OSM datasets and combined into one shapefile. We then calculated the number of parks within a 500m circular buffer of each postal code.
+
+```{r}
+library(tidyverse)
+library(sf)
+
+load("Data/CMAcodes")
+
+for(i in CMAcodes){
+  cmpk <- st_read(paste0("Data/Space_for_Play_Dimension/CMAparkpolygons/cmapks", i, ".shp"))
+  cmpk <- st_transform(cmpk, 3347)
+  osmpk <- st_read(paste0("Data/Space_for_Play_Dimension/OSMparkpolygons/osmpk_", i, ".shp"))
+  osmpk <- st_transform(osmpk, 3347)
+  
+  temppc <- st_read(paste0("Data/CanMapPC/CMAPC", i, ".shp"))
+  temppc <- st_transform(temppc, 3347)
+  tempbuf <- st_buffer(temppc, 500)
+  
+  # add an id variable
+  osmpk$osm_id <- 1:nrow(osmpk)
+  cmpk$cm_id <- 1:nrow(cmpk)
+   osmpk <- osmpk[, c("osm_id")]
+   cmpk <- cmpk[, "cm_id"]
+  
+  all_parks <- st_join(osmpk, cmpk)
+  
+    
+    # add an id variable
+    all_parks$id <- 1:nrow(all_parks)
+    all_parks$id <- all_parks[, "id"]
+    
+    all_parks <- st_make_valid(all_parks)
+    
+    tempbuf$parks <- 0
+    
+    sf_use_s2(FALSE)
+    p <- st_intersects(tempbuf,all_parks, sparse = TRUE)
+    sf_use_s2(FALSE)
+    p <- as.data.frame(p)
+    colnames(p) <- c("parks", "rowid")
+    
+    temppc <- st_drop_geometry(temppc)
+    temppc$rowid <- rownames(temppc)
+    temppc <- temppc[, c(1,4)]
+    colnames(temppc) <- c("id", "rowid")
+    
+    tempks <- merge(temppc, p, by = "rowid", all = TRUE)
+    tempks <- tempks %>%
+      mutate(parks = replace(parks, !is.na(parks), 1)) %>%
+      mutate(parks = replace(parks, is.na(parks), 0))
+    tempks <- tempks[, -1]
+    
+    tempks <- tempks %>%
+      group_by(id, ) %>%
+      summarise(parks = sum(parks))
+    
+    write_csv(tempks, paste0("Data/Space_for_Play_Dimension/all_parks", i, ".csv"))
+    rm(cmpk, osmpk, all_parks, p, tempbuf, temppc, tempks)
+    gc()
+    
+    }
+
+```
+
+#### Informal Space for Play Indicator
+
+For the building density indicator, representing potential informal spaces for play, we downloaded building footprint data (percent within 250m of postal codes) from the Canadian Urban Environmental Health Research Consortium database. We calculated the inverse of the proportion of 250m circular buffer around the postal code centroid that is part of the building footprint (representing the proportion of a 250m circular buffer around postal code that is not part of building footprint).
+
+```{r}
+
+library(readr)
+library(sf)
+library(dplyr)
+library(tidyverse)
+
+
+load("Data/CMAcodes")
+
+bd_full <- read_csv("W:/Metric Development/PlayabilityMetric/Data/Space_for_Play_Dimension/Building Density/nhbld_ava_19.csv")
+colnames(bd_full) <- c("POSTALCODE", "PR", "Lat", "Lon", "bd_100", "bd_250","bd_500","bd_1000")
+bd <- as.data.frame(bd_full[,c(1,6)])
+
+rm(bd_full)
+
+for (i in CMAcodes){
+  temppc <- st_read(paste0("Data/CanMapPC/CMAPC", i, ".shp")) 
+  colnames(temppc) <- c("POSTALCODE", "CMAUID", "CMANAME", "geometry")
+  temppc<- temppc[,-c(2,3)]
+  temppc <- st_drop_geometry(temppc)
+  
+  tempbd <- merge(bd, temppc, by = "POSTALCODE")
+                
+  write_csv(tempbd, file = (paste0("Data/Space_for_Play_Dimension/Building Density/bd_", i, ".csv")), append = FALSE)
+  
+  rm(tempbd)
+  gc()
+}
+
+
+```
+
+## Natural Environment Indicators
+
+Indicators for the natural environment domain include tree canopy, normalized difference vegetation index (NDVI) and blue space measures.
+
+#### Tree Canopy Indicator
+
+We downloaded tree canopy data from the Canadian Urban Environmental Research Consortium database. Annual average tree canopy within a 250m buffer of postal code centroids was available for all study cities except St. John's.
+
+```{r}
+library(terra)
+library(sf)
+library(dplyr)
+library(tidyverse)
+library(readr)
+library(naniar)
+
+
+load("Data/CMAcodes")
+
+trees_full <- read_csv("Data/Natural_Environment_Dimension/Tree Canopy/grtcc_ava_15.csv")
+trees_full <- as.data.frame(trees_full)
+trees_full <- trees_full[,c(1,7)]
+colnames(trees_full) <- c("POSTALCODE", "tr_250")
+
+trees_full <- trees_full %>%
+  replace_with_na(replace = list(tr_250 = c(-9999, -1111)))
+
+
+
+for (i in CMAcodes){
+  temppc <- st_read(paste0("Data/CanMapPC/CMAPC", i, ".shp")) 
+  temppc<- temppc[,-c(2,3)]
+  colnames(temppc) <- c("POSTALCODE","geometry")
+  temppc <- st_drop_geometry(temppc)
+  
+  cmatr <- filter(trees_full, trees_full$POSTALCODE %in% temppc$POSTALCODE)
+  
+ temptr <- merge(temppc, cmatr, all.x = TRUE) 
+ temptr <- na.omit(temptr)
+ write_csv(temptr, (paste0("Data/Natural_Environment/Tree_Canopy/tc250_", i,".csv")), append = FALSE) 
+
+  rm(cmatr, temptr)
+  gc()
+}
+
+```
+
+For St. John's, we downloaded NASA Earthdata Global Forest Cover Change (GFCC) Tree Cover Multi-Year Global 30m tree canopy estimates (only 2005 data was available for St. John's) and calculated the average tree canopy within a 250m buffer of each postal code centroid.
+
+```{r}
+
+trees_111 <- rast("Data/Natural_Environment/Tree_Canopy/p002r027_TC_2005.tif")
+trees_111_err <- rast("Data/Natural_Environment/Tree_Canopy/p002r027_TC_2005_err.tif")
+
+treelist <- list(trees_111, trees_111_err)
+tr_111 <- rast(treelist)
+
+temppc <- st_read(paste0("Data/CanMapPC/CMAPC", i, ".shp"))
+tempbuf <- st_buffer(temppc, dist = 250)
+tempbuf <- st_transform(tempbuf, crs(tr_111))
+tempbuf <- tempbuf[,1]
+colnames(tempbuf) <- c("POSTALCODE", "geometry")
+
+tr_111 <- crop(tr_111, tempbuf)
+tr_111 <- terra::extract(tr_111, vect(tempbuf))
+tr_111 <- tr_111[, c(1,2)]
+
+#limit to valid values (0-100)
+tr_111 <- tr_111[tr_111$p002r027_TC_2005 < 101,]
+
+tempbuf$ID <- rownames(tempbuf)
+tb <- st_drop_geometry(tempbuf)
+tr_111 <- merge(tr_111, tb, by = "ID")
+tr_111 <- tr_111[, -1]
+
+tc111 <- tr_111 %>% 
+  group_by(POSTALCODE) %>% 
+  summarize(tr_250 = mean(p002r027_TC_2005))
+  
+write_csv(tc111, "Data/Natural_Environment/Tree_Canopy/tc250_111.csv", append = FALSE)
+ 
+rm(trees_111, trees_111_err, temppc, tempbuf, tb, tr_111, tc_111)
+gc()
+```
+
+#### NDVI Indicator
+
+NDVI annual average within 250m circular buffers of postal codes for three years (2017, 2018 and 2019) was downloaded from the Canadian Urban Environmental Research Consortium data repository. We calculated the three-year average NDVI for each postal code.
+
+```{r}
+library(tidyverse)
+library (sf)
+library(sfheaders)
+library(readr)
+
+setwd("W:/Metric Development/PlayabilityMetric")
+
+NDVI19 <- read.csv("Data/Natural_Environment_Dimension/NDVI_datasets/grlan_amn_19.csv")
+NDVI19 <- NDVI19[, c(1, 7)]
+colnames(NDVI19) <- c("id", "ndvi19_250")
+
+NDVI18 <- read.csv("Data/Natural_Environment_Dimension/NDVI_datasets/grlan_amn_18.csv")
+NDVI18 <- NDVI18[, c(1, 7)]
+colnames(NDVI18) <- c("id", "ndvi18_250")
+
+NDVI17 <- read_csv("Data/Natural_Environment_Dimension/NDVI_datasets/grlan_amn_17.csv")
+NDVI17 <- NDVI17[, c(1, 7)]
+colnames(NDVI17) <- c("id", "ndvi17_250")
+
+# Merge all three years by postal code and create a three year average
+ndvi <- list(NDVI19, NDVI18, NDVI17) %>% 
+  reduce(full_join, by = "id")
+
+ndvi$ndvi17_250 <- na_if(ndvi$ndvi17_250, -9999)
+ndvi$ndvi17_250 <- na_if(ndvi$ndvi17_250, -1111)
+ndvi$ndvi18_250 <- na_if(ndvi$ndvi18_250, -9999)
+ndvi$ndvi18_250 <- na_if(ndvi$ndvi18_250, -1111)
+ndvi$ndvi19_250 <- na_if(ndvi$ndvi19_250, -9999)
+ndvi$ndvi19_250 <- na_if(ndvi$ndvi19_250, -1111)
+
+ndvi$ndvi_avg <- round((ndvi$ndvi19_250 + ndvi$ndvi18_250 + ndvi$ndvi17_250)/3, digits = 2)
+
+for (i in CMAcodes){
+  temppc <- read_csv(paste0("Data/r5r_Road_Networks/r5r", i, "/CMAPC", i, ".csv"))
+  temppc<- temppc[,1]
+  tempNDVI <- merge(temppc, ndvi, left_join =TRUE)
+  write_csv(tempNDVI, file= (paste0("Data/Natural_Environment_Dimension/NDVI_datasets/ndvi", i, ".csv")), append = FALSE)
+  rm(temppc, tempNDVI)
+  gc()
+}
+```
+
+#### Blue Space Indicator
+
+This script uses CanMap Content Suite v3, 2020 Landcover data to determine proportion of blue space within 1000m circular buffer of postal code centroids.
+
+```{r}
+
+library(sf)
+library(tidyverse)
+library(naniar)
+library(units)
+
+load("Data/CMAcodes")
+lc <- st_read("Data/Natural_Environment_Dimension/LandCover/LandCoverRegion.shp")
+
+lc <- filter(lc, lc$CATEGORY == "WATERBODY")
+lc <- lc[,1]
+lc <- st_transform(lc, 3347)
+
+for(i in CMAcodes){
+  pc <- st_read(paste0("Data/CanMapPC/CMAPC", i, ".shp"))
+  buf_1000 <- st_buffer(pc, dist = 1000)
+  
+  lctemp <- st_crop(lc, st_bbox(pc))
+
+  pcblue <- st_intersection(buf_1000, lctemp, left_join = TRUE)
+  
+  pcblue$blue_area <- st_area(pcblue) %>%
+    drop_units()
+  
+  buf_1000$total_area <- st_area(buf_1000) %>%
+    drop_units()
+  
+  pcblue <- pcblue %>% group_by(POSTALCODE) %>% 
+    summarize(blue_area = sum(blue_area)) 
+  
+  buf_1000 <- st_drop_geometry(buf_1000)
+  pcblue <- st_drop_geometry(pcblue)
+  
+  pcblue <- merge(buf_1000, pcblue, all.x = TRUE)
+  pcblue[is.na(pcblue)] <- 0
+  
+  pcblue$blue_prop <- (pcblue$blue_area / pcblue$total_area)*100
+  
+  pcblue <- pcblue[,c(1,6)]
+  colnames(pcblue) <- c("id", "bluesp")
+  
+  write_csv(pcblue, paste0("Data/Natural_Environment/Blue Space/blu_", i,".csv"), append = FALSE)
+  
+  rm(buf_1000, pcblue, pc, lctemp)  
+  gc()
+}
+
+rm(lc)
+
+```
+
+## **Across-City Playability Scores: weighting and aggregation**
+
+To enable across-city comparisons, indicator values for postal codes across all cities were normalized, scaled to a standard range (0.0001-10) and, for for some indicators, reverse coded (road type, intersections, residential mobility, proportion recently immigrated). Indicators for each domain were then aggregated, using additive aggregation method, with weighting based expert survey results. This was accomplished in four steps:
+
+\# Step 1: combine data for each indicator from all CMAs
+
+\# Step 2: normalize and scale indicator data, check histograms
+
+\# Step 3: weight indicators based on expert survey results
+
+\# Step 4: aggregate indicators into playability domains
+
+First, we will make a file containing postal codes for all study cities.
+
+```{r}
+
+library(readr)
+library(sf)
+library(tidyverse)
+library(DescTools)
+library(gridExtra)
+library(ggplot2)
+library(ggridges)
+library(basemaps)
+library(forcats)
+library(naniar)
+library(purrr)
+library(ggcorrplot)
+library(ggpubr)
+library(ggstatsplot)
+
+load("Data/CMAcodes")
+
+
+#set up postal code shapefiles
+datalist <- list()
+
+for(i in CMAcodes){
+  temppc <- read_csv(paste0("Data/r5r_Road_Networks/r5r", i, "/CMAPC", i, ".csv"))
+  datalist[[i]] <- temppc
+}
+
+all_pc <- do.call(rbind, datalist)
+all_pc$cma <- as.character(row.names(all_pc)) %>%
+  substr(., 1,3)
+all_pc <- all_pc[, c(1,4)]
+
+all_pc$cma_name <- car::recode(all_pc$cma, "568 = 'Barrie';
+                                522 = 'Belleville/Quinte West';
+                                543 =  'Brantford'; 
+                                825 =  'Calgary';
+                                835 =  'Edmonton';
+                                580 =  'Greater Sudbury/Grand Sudbury';
+                                550 =  'Guelph';
+                                205 =  'Halifax';
+                                537 =  'Hamilton';
+                                915 =  'Kelowna';
+                                521 =  'Kingston';
+                                541 =  'Kitchener/Cambridge/Waterloo';
+                                810 =  'Lethbridge';
+                                555 =  'London';
+                                305 =  'Moncton';
+                                462 =  'Montréal';
+                                532 =  'Oshawa';
+                                505 =  'Ottawa/Gatineau';
+                                529 =  'Peterborough';
+                                421 =  'Québec';
+                                705 =  'Regina';
+                                408 =  'Saguenay';
+                                310 =  'Saint John';
+                                725 =  'Saskatoon';
+                                433 =  'Sherbrooke';
+                                539 =  'St.Catharines/Niagara';
+                                111 =  'St.Johns';
+                                595 =  'Thunder Bay';
+                                535 =  'Toronto';
+                                442 =  'Trois-Rivières';
+                                933 =  'Vancouver';
+                                935 =  'Victoria';
+                                559 =  'Windsor';
+                                 602 = 'Winnipeg';
+                                932 = 'Abbotsford/Mission'")
+
+all_pc[all_pc$cma_name == "St.Johns", "cma_name"] <- "St.John's"
+
+#in order to check missing data later, group by cma and find total number of postal codes
+pc_totals <- all_pc %>%
+  group_by(cma_name) %>%
+  summarize(n = n())
+
+#read in the dataframe where CMA's are ranked by population
+ranks <- read_csv("Data/Census Data/cma_ranks.csv")
+
+#order alphabetically by cma_name
+ranks <- ranks[order(ranks$cma_name),]
+ranks <- ranks[, 2]
+
+#order pc data alphabetically and rbind the ranking column
+pc_totals <- pc_totals[order(pc_totals$cma_name),]
+pc_totals <- cbind(pc_totals, ranks)
+
+all_pc <- merge(all_pc, pc_totals, by = "cma_name", all.x = TRUE)
+all_pc <- all_pc[, c(2,3,1,5)]
+
+rm(ranks, pc_totals, datalist, temppc)
+gc()
+
+write_csv(all_pc, "Data/Postal_Codes/all_pc.csv")
+
+
+```
+
+#### **Make Traffic Environment Domain**
+
+Scale, weight and aggregate the traffic environment indicators: road type, intersections, walking routes, and cycling routes.
+
+```{r}
+
+#Road Type 
+
+all_pc <- read_csv("Data/Postal_Codes/all_pc.csv")
+
+# make a list of road type indicator data from each postal code
+datalist <- list()
+
+for (i in CMAcodes) {
+  traf_rd <- read_csv(paste0("Data/Traffic_Environment_Dimension/RoadsData/across_city_rl250_", i, ".csv"))
+  datalist[[i]] <- traf_rd 
+}
+
+# rbind data for road type indicator from all CMAs
+traf_rd = do.call(rbind, datalist)
+
+# view summary
+summary(traf_rd)
+
+
+# normalize, scale and reverse code indicator
+traf_rd$rd_norm <- (traf_rd$rd_total - mean(traf_rd$rd_total))/sd(traf_rd$rd_total)
+traf_rd$rd_norm <- scales::rescale(traf_rd$rd_norm, to = c(0.0001, 10))
+traf_rd$rd_norm <- 10.0001 - traf_rd$rd_norm
+
+# Limit to needed columns, rename columns
+traf_rd <- traf_rd[,c(1,7)]
+traf_rd <- as.data.frame(traf_rd)
+colnms <- c('id', 'rd_norm')
+colnames(traf_rd) <- colnms
+
+hist(traf_rd$rd_norm)
+
+rm(datalist)
+gc()
+
+# Traffic environment: intersections 
+
+datalist <- list()
+
+for (i in CMAcodes) {
+  traf_int <- read_csv(paste0("Data/Traffic_Environment_Dimension/Intersections/int_ind", i, ".csv"))
+  datalist[[i]] <- traf_int # add it to your list
+}
+
+#make intersection scores based on all city data
+traf_int = do.call(rbind, datalist)
+
+# scale and reverse code intersection indicator
+traf_int$int_norm <- (traf_int$intersections - mean(traf_int$intersections))/sd(traf_int$intersections)
+traf_int$int_norm <- scales::rescale(traf_int$int_norm, to = c(0.0001, 10))
+traf_int$int_norm <- 10.0001 - traf_int$int_norm
+traf_int <- traf_int[, -2]
+
+#rename columns
+colnames(traf_int) <- c("id", "int_norm")
+
+hist(traf_int$int_norm)
+
+
+rm(datalist)
+gc()
+
+# Traffic environment: walking routes and cycling routes
+datalist <- list()
+
+for (i in CMAcodes) {
+  traf_walk <- read_csv(paste0("Data/Traffic_Environment_Dimension/Walking/walk_ind_", i, ".csv"))
+  datalist[[i]] <- traf_walk # add it to your list
+}
+traf_walk = do.call(rbind, datalist)
+
+summary(traf_walk)
+traf_walk <- traf_walk[, c(1,10)]
+
+# scale indicator
+traf_walk$walk_norm <-(traf_walk$total_wk - mean(traf_walk$total_wk))/sd(traf_walk$total_wk)
+traf_walk$walk_norm <- scales::rescale(traf_walk$walk_norm, to = c(0.0001, 10))
+traf_walk <- traf_walk[, c(1,3)]
+
+hist(traf_walk$walk_norm)
+
+
+# Traffic environment: cycling routes
+# rbind data for all cmas
+datalist <- list()
+
+for (i in CMAcodes) {
+  traf_cyc <- read_csv(paste0("Data/Traffic_Environment_Dimension/Cycling/cyc_ind_", i, ".csv"))
+  datalist[[i]] <- traf_cyc # add it to your list
+}
+
+#combine cycling scores based on all city data
+traf_cyc = do.call(rbind, datalist)
+traf_cyc <- traf_cyc[, c(1,10)]
+
+# normalize and scale indicator
+traf_cyc$cyc_norm <-(traf_cyc$total_cyc - mean(traf_cyc$total_cyc))/sd(traf_cyc$total_cyc)
+traf_cyc$cyc_norm <- scales::rescale(traf_cyc$cyc_norm, to = c(0.0001, 10))
+traf_cyc <- as.data.frame(traf_cyc[, c(1,3)])
+
+hist(traf_cyc$cyc_norm)
+
+rm(datalist)
+gc()
+```
+
+#### **Make Social Environment Domain**
+
+```{r}
+
+# rbind postal code data from all CMAs
+datalist <- list()
+for (i in CMAcodes) {
+  soc_ind <- read_csv(paste0("Data/Social_Environment/sdi_", i, ".csv"))
+  datalist[[i]] <- soc_ind # add it to your list
+}
+
+soc_ind <- do.call(rbind, datalist)
+soc_ind <- soc_ind[, c(1,4,7,10)]
+colnames(soc_ind) <- c("id", "under15", "movers5", "imm5" )
+
+
+# merge with all pcs and remove missing data
+soc_ind <- merge(all_pc, soc_ind, by = "id", all.x = TRUE)
+
+#check for missing data
+gg_miss_var(soc_ind, show_pct = TRUE)
+
+miss1 <- soc_ind[is.na(soc_ind$under15), ]
+miss1 <- miss1 %>%
+  group_by(cma_name) %>%
+  summarise(u15 = n())
+miss2 <- soc_ind[is.na(soc_ind$movers5), ]
+miss2 <- miss2 %>%
+  group_by(cma_name) %>%
+  summarise(m5 = n())   
+miss3 <- soc_ind[is.na(soc_ind$imm5), ]
+miss3 <- miss3 %>%
+  group_by(cma_name) %>%
+  summarise(im5 = n())
+
+missingpct <- merge(missingpct, miss1, by = "cma_name", all.x = TRUE)
+missingpct <- merge(missingpct, miss2, by = "cma_name", all.x = TRUE)
+missingpct <- merge(missingpct, miss3, by = "cma_name", all.x = TRUE)
+
+soc_ind <- na.omit(soc_ind)
+
+# normalize, scale (and reverse code movers5 and imm5)
+soc_ind$under15_norm <- (soc_ind$under15 - mean(soc_ind$under15))/sd(soc_ind$under15)
+soc_ind$under15_norm <- scales::rescale(soc_ind$under15_norm, to = c(0.0001, 10))
+
+soc_ind$movers5_norm <- (soc_ind$movers5 - mean(soc_ind$movers5))/sd(soc_ind$movers5)
+soc_ind$movers5_norm <- scales::rescale(soc_ind$movers5_norm, to = c(0.0001, 10))
+soc_ind$movers5_norm <- 10.0001 - soc_ind$movers5_norm
+
+soc_ind$imm5_norm <- (soc_ind$imm5 - mean(soc_ind$imm5))/sd(soc_ind$imm5)
+soc_ind$imm5_norm <- scales::rescale(soc_ind$imm5_norm, to = c(0.0001, 10))
+soc_ind$imm5_norm <- 10.0001 - soc_ind$imm5_norm
+
+soc_ind <- na.omit(soc_ind)
+# weight social env indicators
+soc_ind$sdi <- (soc_ind$under15_norm*(0.55)) +
+  (soc_ind$movers5_norm*(0.24)) +
+  (soc_ind$imm5_norm*(0.21))
+
+#soc_ind$sdi <- (soc_ind$sdi - mean(soc_ind$sdi))/sd(soc_ind$sdi)
+soc_ind$sdi <- scales::rescale(soc_ind$sdi, to = c(0.0001, 10))
+hist(soc_ind$sdi)
+
+write_csv(soc_ind, file = "Data/Across_City_PS/reweighted_ac_sdi_additive.csv", append = FALSE)
+
+```
+
+#### **Make Space for Play Domain**
+
+```{r}
+
+```
+
+#### **Make Natural Environment Domain**
+
+```{r}
+
+```
+
+#### **Make Child-Relevant Destinations Domain**
+
+```{r}
+
+```
+
+## **Across-City Playscore, weighting and aggregation of domains**
+
+## 
